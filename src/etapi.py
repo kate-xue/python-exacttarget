@@ -2,6 +2,7 @@ import uuid
 import logging
 import os
 import sys
+import glob
 
 import suds
 from suds.client import Client
@@ -14,6 +15,7 @@ class ExactTargetAPI:
     def __init__(self, username, password, schema_url=None, log_path=None):
         self.username = username
         self.password = password
+        self.client_id = None
 
         # it's possible to provide your own modified schema
         if(schema_url):
@@ -55,6 +57,10 @@ class ExactTargetAPI:
         security.tokens.append(token)
         self.client.set_options(wsse=security)
         return self.client
+
+    def set_client_id(self, cid):
+        self.client_id = self.create('ClientID')
+        self.client_id.ID = cid
 
     def add_to_triggered_send_definition(self, tsd_key, email, subscriberkey,
                                          attribs=None):
@@ -114,13 +120,13 @@ class ExactTargetAPI:
 
     def add_to_data_extension(self, de_key, rows):
         opts = []
-        
+
         # convert props to WSDL format
         for props in rows:
             apiprops = []
             for k in props.keys():
                 apiprops.append(self._create_api_property(k, props[k]))
-    
+
             # create DE and map in our properties array
             deo = self.client.factory.create('DataExtensionObject')
             innerprops = []
@@ -128,9 +134,9 @@ class ExactTargetAPI:
                 innerprops.append(p)
                 deo.Properties = [{'Property': innerprops}]
                 deo.CustomerKey = de_key
-            
+
             opts.append(deo)
-            
+
         # createoptions for insertion
         co = self.client.factory.create('CreateOptions')
         co.RequestType = 'Asynchronous'
@@ -171,47 +177,50 @@ class ExactTargetAPI:
             pass
 
         return None
-    
+
     def create(self, objtype, key=None):
         obj = self.client.factory.create(objtype)
-        
+
         for p in obj.__keylist__:
             obj[p] = None
-        
+
         if key is not None:
-            obj.CustomerKey = key
-        
+            if objtype == 'Subscriber':
+                obj.SubscriberKey = key
+            else:
+                obj.CustomerKey = key
+
         return obj
-    
+
     def _deo_to_list(self, resp):
         results = []
-        
+
         if 'Results' not in resp:
             return None
-        
+
         for r in resp.Results:
             row = {}
-            
+
             for p in r.Properties.Property:
                 row[p.Name] = p.Value
-                
+
             results.append(row)
-            
+
         return results
-    
+
     def get_data_extension(self, de_key, cols, start_date=None, start_date_field=None, more_data=True):
         rr = self.client.factory.create('RetrieveRequest')
         rr.ObjectType = 'DataExtensionObject[' + de_key + ']'
         rr.Properties = cols
         rr.Options = None
-        
+
         if start_date is not None and start_date_field is not None:
             sfp = self.client.factory.create('SimpleFilterPart')
             sfp.Property = start_date_field
             sfp.SimpleOperator = 'greaterThanOrEqual'
             sfp.Value = start_date
             rr.Filter = sfp
-        
+
         while True:
             try:
                 resp = self.client.service.Retrieve(rr)
@@ -224,7 +233,7 @@ class ExactTargetAPI:
             while resp.OverallStatus == 'MoreDataAvailable':
                 rr = self.client.factory.create('RetrieveRequest')
                 rr.ContinueRequest = resp.RequestID
-                
+
                 while True:
                     try:
                         resp = self.client.service.Retrieve(rr)
@@ -232,66 +241,83 @@ class ExactTargetAPI:
                     except suds.WebFault:
                         continue
                     break
-                
-    def get_object(self, objtype, props):
+
+    def get_object(self, objtype, props, filters=None):
         rr = self.create('RetrieveRequest')
         rr.ObjectType = objtype
         rr.Properties = props
-        
+        rr.ClientIDs  = [self.client_id]
+
+        if filters is not None:
+            sfp = self.client.factory.create('SimpleFilterPart')
+            sfp.Property = filters[0]
+            sfp.SimpleOperator = 'equals'
+            sfp.Value = filters[1]
+            rr.Filter = sfp
+
         try:
             resp = self.client.service.Retrieve(rr)
         except suds.WebFault as e:
             raise SoapError(str(e))
-        
+
         if resp.OverallStatus != 'OK':
             self.log(resp, logging.ERROR)
             raise ExactTargetError(resp.RequestID, resp.Results[0].StatusMessage)
-        
-        return resp.Results
-    
+
+        if hasattr(resp, 'Results'):
+            return resp.Results
+        else:
+            return []
+
     def strip_object(self, obj):
-        id_list = ['ObjectID', 'ID', 'CustomerKey']
-        
+        id_list = ['ObjectID', 'ID', 'CustomerKey', 'SubscriberKey']
+
         for p in obj.__keylist__:
                 if p not in id_list:
                     obj[p] = None
-                    
+
         return obj
-    
+
     def delete_objects(self, objs):
         for o in objs:
             self.strip_object(o)
 
+        do = self.client.factory.create('DeleteOptions')
+        do.RequestType = 'Asynchronous'
+        do.QueuePriority = 'High'
+
         try:
-            resp = self.client.service.Delete(None, objs)
+            resp = self.client.service.Delete(do, objs)
         except suds.WebFault as e:
             raise SoapError(str(e))
-        
+
         if resp.OverallStatus != 'OK':
             self.log(resp, logging.ERROR)
             raise ExactTargetError(resp.RequestID, resp.Results[0].StatusMessage)
-        
+
         return True
-    
+
     def update_object(self, obj):
         try:
             resp = self.client.service.Update(None, obj)
         except suds.WebFault as e:
             raise SoapError(str(e))
-        
+
         if resp.OverallStatus != 'OK':
             self.log(resp, logging.ERROR)
             raise ExactTargetError(resp.RequestID, resp.Results[0].StatusMessage)
-        
+
         return True
-    
+
     def create_email(self, name, subject, is_html, body, folder=None):
         email = self.create('Email')
         email.Name = name
+        email.CustomerKey = name
         email.Subject = subject
-        email.Folder = folder
+        email.CategoryID = folder
         email.CharacterSet = 'UTF-8'
-        
+        email.Client = self.client_id
+
         if is_html:
             email.EmailType = 'HTML'
             email.HTMLBody = body
@@ -299,9 +325,15 @@ class ExactTargetAPI:
         else:
             email.EmailType = 'Text Only'
             email.TextBody = body
-            
+
         try:
-            resp = self.client.service.Create(None, [email])
+            current_emails = self.get_object('Email', ['Name', 'ID'], ['Name', name])
+
+            if (len(current_emails) > 0):
+                email.ID = current_emails[0].ID
+                resp = self.client.service.Update(None, [email])
+            else:
+                resp = self.client.service.Create(None, [email])
         except suds.WebFault as e:
             raise SoapError(str(e))
 
@@ -310,9 +342,9 @@ class ExactTargetAPI:
             raise ExactTargetError(resp.RequestID, resp.Results[0].StatusMessage)
 
         ret_obj = resp.Results[0].Object
-        ret_obj.ID = resp.Results[0].NewID
+        #ret_obj.ID = resp.Results[0].NewID
         return ret_obj
-    
+
     def create_tsd(self, name, key, email, de=None, et_list=None, is_transactional=False, add_subscribers=True):
         tsd = self.create('TriggeredSendDefinition')
         tsd.Name = name
@@ -320,18 +352,18 @@ class ExactTargetAPI:
         tsd.Email = self.strip_object(email)
         tsd.SendClassification = self.create('SendClassification')
         tsd.SendClassification.CustomerKey = 'Default Commercial'
-        
+
         if is_transactional:
             tsd.SendClassification.CustomerKey = 'Default Transactional'
-        
+
         tsd.IsMultipart = True
-        
+
         if et_list:
             tsd.List = self.strip_object(et_list)
             tsd.AutoAddSubscribers = add_subscribers
-            
+
         tsd.SendSourceDataExtension = self.strip_object(de)
-        
+
         try:
             resp = self.client.service.Create(None, [tsd])
         except suds.WebFault as e:
@@ -340,9 +372,9 @@ class ExactTargetAPI:
         if resp.OverallStatus != 'OK':
             self.log(resp, logging.ERROR)
             raise ExactTargetError(resp.RequestID, resp.Results[0].StatusMessage)
-        
+
         return resp.Results[0].Object
-    
+
     def create_data_extension_field(self, name, field_type, is_primary=False, is_nillable=False, length=None, default=None):
         field = self.create('DataExtensionField')
         field.Name = name
@@ -352,16 +384,49 @@ class ExactTargetAPI:
         field.IsNillable = is_nillable
         field.MaxLength = length
         field.DefaultValue = default
-        
+
         return field
-    
+
+    def create_send(self, name, list, email, folder=None, sender=None, delivery=None):
+        esd = self.create('EmailSendDefinition')
+        esd.Name = name
+
+        sdl = self.create('SendDefinitionList')
+        esd.SendDefinitionList = [sdl]
+
+        if folder is not None:
+            esd.CategoryID = folder
+
+        if sender is not None:
+            esd.SenderProfile = self.create('SenderProfile')
+            esd.SenderProfile.Name = sender
+
+        if delivery is not None:
+            esd.DeliveryProfile = self.create('DeliveryProfile')
+            esd.DeliveryProfile.Name = delivery
+
+    def create_portfolio(self, url, folder=None, source=None):
+        p = self.create('Portfolio')
+        p.Source = self.create('ResourceSpecification')
+
+        if source is not None:
+            p.Source.URN = source
+        else:
+            p.Source.URN = url
+
+        if folder is not None:
+            p.CategoryID = folder
+
+        resp = self.client.service.Create(None, [p])
+        return resp.OverallStatus == 'OK'
+
     def create_data_extension(self, name, key, de_fields, sender_field=None, description=None, folder=None, template=None):
         de = self.create('DataExtension')
         de.Name = name
         de.Description = description
         de.CustomerKey = key
         de.IsSendable = False
-        
+
         # TriggeredSendDataExtension
         if template is not None:
             for o in self.get_object('DataExtensionTemplate', ['Name', 'ObjectID']):
@@ -369,16 +434,16 @@ class ExactTargetAPI:
                     de.Template = o
                     sender_field = 'SubscriberKey'
                     break
-        
+
         de.CategoryID = folder
-        
+
         if sender_field is not None:
             de.IsSendable = True
             de.SendableDataExtensionField = sender_field
             de.SendableSubscriberField = self.create('Attribute')
             de.SendableSubscriberField.Name = "Subscriber Key"
             de.SendableSubscriberField.Value = ""
-        
+
         # arrays of self.create_data_extension_field
         de.Fields = {'Field': de_fields}
 
@@ -392,7 +457,7 @@ class ExactTargetAPI:
             raise ExactTargetError(resp.RequestID, resp.Results[0].StatusMessage)
 
         return resp.Results[0].Object
-        
+
     def create_subscriber(self, email, firstname, lastname, listname=None):
         # create subscriber object
         s = self.client.factory.create('Subscriber')
@@ -474,46 +539,46 @@ class ExactTargetAPI:
     def add_subscribers_to_list(self, subs, async=True):
         sublist = self.create('SubscriberList')
         sublist.Action = 'create'
-        
+
         objs = []
-        
+
         for subscribers in subs:
             sublist.ID = subscribers[0]
-            
+
             for email in subscribers[1]:
                 sub = self.create('Subscriber')
                 sub.SubscriberKey = email
                 sub.EmailAddress = email
                 sub.Lists = [sublist]
                 objs.append(sub)
-        
+
         uo = self.create('UpdateOptions')
         if async:
             uo.RequestType = 'Asynchronous'
-        
+
         for obj in chunks(objs, 400):
             try:
                 resp = self.client.service.Create(None, obj)
             except suds.WebFault as e:
                 raise SoapError(str(e))
-            
+
             if resp.OverallStatus != 'OK':
                 self.log(resp, logging.ERROR)
                 raise ExactTargetError(resp.RequestID, resp.Results[0].StatusMessage)
 
     def create_subscriber_lists(self, lists, folder=0):
         objs = []
-        
+
         for li in lists:
             l = self.create('List')
-            
+
             if folder > 0:
                 l.Category = folder
-            
+
             l.CustomerKey = li['key']
             l.ListName = li['name']
             l.Description = li['description']
-            
+
             objs.append(l)
 
         try:
@@ -528,7 +593,7 @@ class ExactTargetAPI:
             list_obs = {}
             for r in resp.Results:
                 list_obs[r.Object.CustomerKey] = r.NewID
-            
+
             return list_obs
 
     def get_email_receivers(self, jobid):
@@ -584,20 +649,60 @@ class ExactTargetAPI:
             return resp.Results[0]
         except AttributeError:
             pass
-    
+
     def create_filter(self, prop, operator, value):
         sfp = self.create('SimpleFilterPart')
         sfp.Property = prop
         sfp.SimpleOperator = operator
         sfp.Value = value
         return sfp
-    
+
+    def get_contents(self, dir, folder=None):
+        for c in self.get_object('ContentArea', ['Name', 'Content'], ['CategoryID', folder]):
+            f = open(".".join(["/".join([dir, c.Name]), "html"]), "wb")
+            f.write(c.Content.encode('utf-8'))
+            f.close()
+
+    def delete_subscribers(self, subs):
+        subscribers = []
+
+        for s in subs:
+            subscribers.append(self.create('Subscriber', s))
+
+        self.delete_objects(subscribers)
+
+    def create_contents(self, namespace, segment, filepath, folder=None):
+        ca = self.create('ContentArea')
+        ca.CategoryID = folder
+        with open(filepath, 'r') as f:
+            ca.Content = f.read().decode('utf-8')
+
+        ca.Name = namespace + '-' + segment + '-' + os.path.splitext(os.path.basename(filepath))[0]
+        ca.CustomerKey = ca.Name
+        ca.Layout = "HTMLWrapped"
+
+        # Specify which Account this content area is going to be uploaded. This is requred if you are uploading data into a sub business unit.
+        client = self.create('ClientID')
+        client.ID = self.client_id.ID
+        ca.Client = client
+
+        current_contents = self.get_object('ContentArea', ['Name', 'ID'], ['Name', ca.Name])
+
+        if (len(current_contents) > 0):
+            ca.ID = current_contents[0].ID
+            resp = self.client.service.Update(None, [ca])
+        else:
+            resp = self.client.service.Create(None, [ca])
+
+        print resp.OverallStatus
+        print ca.Name
+
     def create_filter_definition(self, name, filters, key=None, description=None, operator='AND'):
         fd = self.create('FilterDefinition', key)
         fd.Name = name
         fd.Description = description
         filter_len = len(filters)
-        
+
         if filter_len is 1:
             fd.DataFilter = self.create_filter(*filters[0])
         else:
@@ -605,20 +710,20 @@ class ExactTargetAPI:
             cfp.LeftOperand = self.create_filter(*filters[0])
             cfp.LogicalOperator = operator
             cfp.RightOperand = self.create_filter(*filters[1])
-            
+
             if filter_len > 2:
                 cfp.AdditionalOperands = []
                 for f in filters[2:]:
                     cfp.AdditionalOperands.append(self.create_filter(*f))
-                    
+
             fd.DataFilter = cfp
-            
+
         self.client.service.Create(None, fd)
 
     def start_tsd(self, tsd):
         tsd.TriggeredSendStatus = 'Active'
         self.update_object(tsd)
-    
+
     def stop_tsd(self, tsd):
         tsd.TriggeredSendStatus = 'Inactive'
         self.update_object(tsd)
@@ -626,9 +731,9 @@ class ExactTargetAPI:
     def run_import(self, key):
         im = self.create('ImportDefinition')
         im.CustomerKey = key
-        
+
         objs = {'Definition': [im,]}
-        
+
         try:
             resp = self.client.service.Perform(self.create('PerformOptions'), 'start', objs)
         except suds.WebFault as e:
